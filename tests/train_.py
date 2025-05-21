@@ -2,7 +2,7 @@ from networkx.drawing.nx_pydot import from_pydot
 from transformers import GPT2TokenizerFast
 import torch
 
-from .adapters import  run_transformer_lm,get_adamw_cls,run_get_batch,run_get_lr_cosine_schedule,run_cross_entropy,run_gradient_clipping,run_save_checkpoint
+from adapters import  run_transformer_lm,get_adamw_cls,run_get_batch,run_get_lr_cosine_schedule,run_cross_entropy,run_gradient_clipping,run_save_checkpoint
 tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 tokenizer.add_special_tokens({'pad_token': '<|pad|>'})  # Optional for padding
 
