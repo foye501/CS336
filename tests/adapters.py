@@ -269,7 +269,8 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    inv_freq = 1.0/(theta**(torch.arange(0,d_k,2, device=in_query_or_key.device).float()/d_k))
+    # inv_freq = 1.0/(theta**(torch.arange(0,d_k,2, device=in_query_or_key.device).float()/d_k))
+    inv_freq = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=in_query_or_key.device).to(torch.float64)/ d_k))
     angles = token_positions.float().unsqueeze(-1)* inv_freq
 
     x_1 =in_query_or_key[...,::2]
@@ -282,6 +283,7 @@ def run_rope(
 
     x_rot = torch.stack([x_rot_even, x_rot_odd], dim=-1)
     x_rot = x_rot.view_as(in_query_or_key)
+    x_rot = x_rot.to(in_query_or_key.dtype)
 
     return x_rot
 
@@ -507,7 +509,8 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    norms= torch.sqrt(torch.sum(torch.square(in_features),dim=-1,keepdim=True)*1/d_model)+eps
+    import math
+    norms = in_features.norm(dim=-1, keepdim=True) / math.sqrt(d_model) + eps
     return in_features/norms * weights
 
 

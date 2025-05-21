@@ -70,3 +70,4 @@ def test_get_batch():
             device="cuda:99",
         )
         assert "CUDA error" in str(excinfo.value) or "Torch not compiled with CUDA enabled" in str(excinfo.value)
+
