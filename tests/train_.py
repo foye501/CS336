@@ -69,33 +69,86 @@ for i in range(num_layers):
 
 model = TransformerLM(weights).to(device)
 optimizer = get_adamw_cls()(model.parameters(), lr=learning_rate)
+import time
+import numpy as np
 
-for iteration in range(1, 10001):
+def run_eval(model, val_data, tokenizer, context_length, device, batch_size=8):
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for _ in range(10):  # run 10 batches for quick eval
+            inputs, targets = run_get_batch(val_data, batch_size, context_length, device)
+            logits = run_transformer_lm(
+                vocab_size=len(tokenizer.vocab),
+                context_length=context_length,
+                d_model=d_model,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                d_ff=d_ff,
+                rope_theta=rope_theta,
+                weights=model.state_dict(),
+                in_indices=inputs,
+            )
+            loss = run_cross_entropy(logits[:, -1], targets[:, -1])
+            losses.append(loss.item())
     model.train()
-    x, y = run_get_batch(dataset, batch_size, context_length, device)
-    logits = model(x)
-    logits = logits.view(-1, vocab_size)
-    y = y.view(-1)
+    return np.mean(losses)
 
-    loss = run_cross_entropy(logits, y)
-    loss.backward()
 
-    run_gradient_clipping(model.parameters(), max_l2_norm=1.0)
-    lr = run_get_lr_cosine_schedule(
-        it=iteration,
-        max_learning_rate=learning_rate,
-        min_learning_rate=learning_rate * 0.01,
-        warmup_iters=warmup_iters,
-        cosine_cycle_iters=cosine_cycle_iters,
-    )
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = lr
+def train():
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
 
-    optimizer.step()
-    optimizer.zero_grad()
+    # Load data
+    with open("owt_train.txt", "rb") as f:
+        train_data = np.frombuffer(f.read(), dtype=np.uint8)
+    with open("owt_valid.txt", "rb") as f:
+        val_data = np.frombuffer(f.read(), dtype=np.uint8)
 
-    if iteration % 100 == 0:
-        print(f"Step {iteration}: loss={loss.item():.4f}, lr={lr:.6f}")
 
-    if iteration % 1000 == 0:
-        run_save_checkpoint(model, optimizer, iteration, f"checkpoint_{iteration}.pt")
+
+    # Model
+
+    model.to(device)
+
+    optimizer = get_adamw_cls()(model.parameters(), lr=learning_rate)
+
+    num_iters = 10000
+    context_length = 128
+    log_interval = 100
+    eval_interval = 1000
+
+    for iter in range(num_iters):
+        start_time = time.time()
+
+        inputs, targets = run_get_batch(train_data, batch_size=8, context_length=context_length, device=device)
+        logits = run_transformer_lm(
+            vocab_size=vocab_size,
+            context_length=context_length,
+            d_model=d_model,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            rope_theta=rope_theta,
+            weights=model.state_dict(),
+            in_indices=inputs,
+        )
+
+        loss = run_cross_entropy(logits[:, -1], targets[:, -1])
+
+        optimizer.zero_grad()
+        loss.backward()
+        run_gradient_clipping(model.parameters(), 1.0)
+        optimizer.step()
+
+        if iter % log_interval == 0:
+            print(f"[{iter:>5}] loss = {loss.item():.4f} ({time.time() - start_time:.2f}s)")
+
+        if iter % eval_interval == 0 and iter > 0:
+            val_loss = run_eval(model, val_data, tokenizer, context_length, device)
+            print(f"Eval @iter {iter:>5}: val_loss = {val_loss:.4f}")
+
+            # Optional: save checkpoint
+            run_save_checkpoint(model, optimizer, iter, f"checkpoint_iter{iter}.pt")
+
+train()
