@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures.process import ProcessPoolExecutor
 from typing import IO, Any, BinaryIO
 from collections.abc import Iterable
 
@@ -862,24 +863,40 @@ def get_tokenizer(
     return ManualBPETokenizer(vocab, merges, special_tokens)
 from collections import Counter, defaultdict
 import os
+import regex as re
+from concurrent.futures import ProcessPoolExecutor
 
+
+def pretokenize(text):
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    pattern = re.compile(PAT)
+    return [m.group(0) for m in pattern.finditer(text)]
+
+def process_chunk(chunk, special_tokens):
+    # Split on special tokens, then pretokenize each part
+    pre_token_counts = Counter()
+    pattern = re.compile("|".join(re.escape(tok) for tok in sorted(special_tokens, key=len, reverse=True)))
+    chunks = pattern.split(chunk)
+    # specials = special_pattern.findall(chunk)
+    for i, chunk_text in enumerate(chunks):
+        for tok in pretokenize(chunk_text):
+            pre_token_counts[tok.encode('utf-8')] += 1
+
+    return pre_token_counts
+def process_chunk_args(args):
+    chunk, special_tokens = args
+    return process_chunk(chunk, special_tokens)
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Train a BPE tokenizer matching GPT-2's behavior.
-
-    Args:
-        input_path: Path to training corpus.
-        vocab_size: Total vocabulary size (including special tokens).
-        special_tokens: List of special tokens to add as atomic units.
-
+    """
+    Train a BPE tokenizer matching GPT-2's behavior.
     Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab: Mapping from token ID to bytes.
-            merges: List of merge pairs in order of creation.
+        vocab: Mapping from token ID to bytes.
+        merges: List of merge pairs in order of creation.
     """
     # Initialize vocabulary with single bytes
     vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
@@ -888,122 +905,153 @@ def run_train_bpe(
     merges: list[tuple[bytes, bytes]] = []
     current_id = 256
 
-    # Add special tokens
-    for token in special_token_bytes:
-        vocab[current_id] = token
-        token_to_id[token] = current_id
-        current_id += 1
+    num_processes = 1 if os.path.getsize(input_path) < 10_000_000 else 4
 
-    special_token_set = set(special_token_bytes)
-
-    # Read corpus
     with open(input_path, "rb") as f:
-        corpus = f.read()
+        boundaries = find_chunk_boundaries(
+            f, num_processes, "<|endoftext|>".encode("utf-8"))
+        chunks = []
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+            chunks.append(chunk)
 
-    # Tokenize corpus, treating special tokens as atomic
-    tokens: list[bytes] = []
-    i = 0
-    while i < len(corpus):
-        matched_special = False
-        for special in sorted(special_token_bytes, key=len, reverse=True):  # Longest first
-            if corpus[i:i + len(special)] == special:
-                tokens.append(special)
-                i += len(special)
-                matched_special = True
-                break
-        if not matched_special:
-            tokens.append(bytes([corpus[i]]))
-            i += 1
+    # Prepare the argument list
+    args_list = [(chunk, special_tokens) for chunk in chunks]
 
-    # Initialize pair counts and positions
-    pair_counts = Counter()
-    pair_positions = defaultdict(list)
-    for j in range(len(tokens) - 1):
-        a, b = tokens[j], tokens[j + 1]
-        if a in special_token_set or b in special_token_set:
-            continue
-        pair = (a, b)
-        pair_counts[pair] += 1
-        pair_positions[pair].append(j)
+    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        counters = list(executor.map(process_chunk_args, args_list))
 
+    from functools import reduce
+    from operator import add
+    pre_token_counts = reduce(add, counters, Counter())
+
+    # Build corpus: list of (tuple of token ids, freq)
+    # **Ensures special tokens are always atomic**
+    for token in special_token_bytes:
+        if token not in vocab.values():
+            vocab[current_id] = token
+            token_to_id[token] = current_id
+            current_id += 1
+    token_to_id = {v: k for k, v in vocab.items()}  # Rebuild for safety
+
+    corpus = []
+    for pretoken_bytes, freq in pre_token_counts.items():
+
+        tok_ids = tuple(token_to_id[bytes([b])] for b in pretoken_bytes)
+        corpus.append((tok_ids, freq))
+
+    # special_token_ids = set(token_to_id[tok] for tok in special_token_bytes)
+
+    # BPE merge loop
     while current_id < vocab_size:
-        if not pair_counts:
+        # 1. Count all pairs
+        pair_freq = Counter()
+        for token_seq, freq in corpus:
+            for i in range(len(token_seq) - 1):
+                pair = (token_seq[i], token_seq[i + 1])
+                pair_freq[pair] += freq
+
+        if not pair_freq:
             break
 
-        # Find highest frequency pair, tie-break by earliest occurrence
-        max_count = max(pair_counts.values(), default=0)
-        if max_count == 0:
-            break
-        best_pairs = [pair for pair, count in pair_counts.items() if count == max_count]
-        # GPT-2 tie-breaks by earliest occurrence
-        best_pair = min(
-            best_pairs,
-            key=lambda p: pair_positions[p][0] if pair_positions[p] else float("inf")
+        # 2. Pick the most frequent pair (min() for tie-break)
+        max_count = max(pair_freq.values())
+        candidates = [pair for pair, count in pair_freq.items() if count == max_count]
+        # print("cadidate",vocab[candidates[0][0]])
+        best_pair = max(
+            candidates,
+            key=lambda pair: (vocab[pair[0]], vocab[pair[1]]) # I took nearly  2weeks for here,# IMPORTANT: When there are multiple pairs tied for the highest frequency,
+                # GPT-2's BPE merges the lexicographically *greatest* pair.
+                # This means we compare the actual bytes for the two tokens in each pair,
+                # first by the left token, then by the right token if needed.
+                # I spent nearly two weeks tracking down subtle errors here—
+                # it’s *crucial* to use (vocab[pair[0]], vocab[pair[1]]) for lexicographic order,
+                # not their sum or just the IDs.
+                # Changing this fixed all my reference mismatches!
+            # (It’s a pain point: this tiny detail tripped me up for almost two weeks!)
         )
 
-        new_token = best_pair[0] + best_pair[1]
-        # Prevent merges that create special token subsequences
-        skip_merge = False
-        for special in special_token_bytes:
-            if new_token in special or special in new_token:
-                skip_merge = True
-                break
-        if skip_merge:
-            del pair_counts[best_pair]
-            pair_positions[best_pair].clear()
-            continue
+            # print(f"Chosen pair: {ord(vocab[best_pair[0]])} {ord(vocab[best_pair[1]])}")
+        # 3. Add new token to vocab
+        merged_bytes = vocab[best_pair[0]] + vocab[best_pair[1]]
+        vocab[current_id] = merged_bytes
+        token_to_id[merged_bytes] = current_id
+        merges.append((vocab[best_pair[0]], vocab[best_pair[1]]))
 
-        # Add new token
-        vocab[current_id] = new_token
-        token_to_id[new_token] = current_id
-        merges.append(best_pair)
+        # 4. Rebuild the corpus: replace every occurrence of best_pair with new token
+        new_corpus = []
+        for token_seq, freq in corpus:
+            new_seq = []
+            i = 0
+            while i < len(token_seq):
+                # Check for the pair at i, i+1
+                if i < len(token_seq) - 1 and (token_seq[i], token_seq[i + 1]) == best_pair:
+                    new_seq.append(current_id)
+                    i += 2  # skip next, because it's merged
+                else:
+                    new_seq.append(token_seq[i])
+                    i += 1
+            new_corpus.append((tuple(new_seq), freq))
+        corpus = new_corpus
 
-        # Update tokens and pair counts
-        new_tokens = []
-        new_pair_positions = defaultdict(list)
-        i = 0
-        while i < len(tokens):
-            if i + 1 < len(tokens) and (tokens[i], tokens[i + 1]) == best_pair:
-                new_tokens.append(new_token)
-                # Update adjacent pairs
-                if i > 0 and tokens[i - 1] not in special_token_set and new_token not in special_token_set:
-                    new_pair = (tokens[i - 1], new_token)
-                    pair_counts[new_pair] += 1
-                    new_pair_positions[new_pair].append(i - 1)
-                if i + 2 < len(tokens) and tokens[i + 2] not in special_token_set and new_token not in special_token_set:
-                    new_pair = (new_token, tokens[i + 2])
-                    pair_counts[new_pair] += 1
-                    new_pair_positions[new_pair].append(i)
-                # Remove old pairs
-                if i > 0:
-                    old_pair = (tokens[i - 1], tokens[i])
-                    if old_pair in pair_counts:
-                        pair_counts[old_pair] -= 1
-                        if pair_counts[old_pair] == 0:
-                            del pair_counts[old_pair]
-                        pair_positions[old_pair].pop(0)
-                old_pair = (tokens[i], tokens[i + 1])
-                if old_pair in pair_counts:
-                    pair_counts[old_pair] -= 1
-                    if pair_counts[old_pair] == 0:
-                        del pair_counts[old_pair]
-                    pair_positions[old_pair].pop(0)
-                if i + 2 < len(tokens):
-                    old_pair = (tokens[i + 1], tokens[i + 2])
-                    if old_pair in pair_counts:
-                        pair_counts[old_pair] -= 1
-                        if pair_counts[old_pair] == 0:
-                            del pair_counts[old_pair]
-                        pair_positions[old_pair].pop(0)
-                i += 2
-            else:
-                new_tokens.append(tokens[i])
-                if i + 1 < len(tokens) and tokens[i] not in special_token_set and tokens[i + 1] not in special_token_set:
-                    pair = (tokens[i], tokens[i + 1])
-                    new_pair_positions[pair].append(i)
-                i += 1
-        tokens = new_tokens
-        pair_positions = new_pair_positions
         current_id += 1
 
+
+
     return vocab, merges
+
+
+import os
+from typing import BinaryIO
+
+
+def find_chunk_boundaries(
+        file: BinaryIO,
+        desired_num_chunks: int,
+        split_special_token: bytes
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), (
+        "Must represent special token as a bytestring"
+    )
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+
