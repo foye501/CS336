@@ -941,88 +941,92 @@ def run_train_bpe(
         tok_ids = tuple(token_to_id[bytes([b])] for b in pretoken_bytes)
         corpus.append((tok_ids, freq))
 
-    # special_token_ids = set(token_to_id[tok] for tok in special_token_bytes)
-    import heapq
-    heap = []
+
     pair_freq = Counter()
+
     pair_to_position = defaultdict(set)
     for idx, (token_seq, freq) in enumerate(corpus):
         # 1. Count all pairs
         for i in range(len(token_seq) - 1):
             a, b = token_seq[i], token_seq[i + 1]
             pair_freq[(a, b)] += freq
-            heapq.heappush(
-                heap,
-                (
-                    -freq,  # Max-heap by freq
-                    vocab[a],  # Lexicographic: first token bytes
-                    vocab[b],  # Lexicographic: second token bytes
-                    (a, b)  # The actual pair of token IDs
-                )
-            )
             pair_to_position[(a, b)].add((idx, i))
-    for (a, b), freq in pair_freq.items():
-        heapq.heappush(heap, (-freq, vocab[a], vocab[b], (a, b)))
+    print(corpus[:10])
+    print(vocab)
     # BPE merge loop
-    while current_id < vocab_size:
-
+    print(pair_freq)
+    while current_id < vocab_size :
 
         if not pair_freq:
             break
-        # max_count = max(pair_freq.values())
+        best_pair = max(
+            pair_freq.items(),
+            key=lambda x: (-x[1], vocab[x[0][0]], vocab[x[0][1]])
+        )[0]
 
-        while heap:
-            neg_freq, bytes_a, bytes_b, best_pair = heapq.heappop(heap)
-            if -neg_freq == pair_freq[best_pair]:
-                break
 
-        merged_bytes = bytes_a + bytes_b
+        merged_bytes = vocab[best_pair[0]]+vocab[best_pair[1]]
         vocab[current_id] = merged_bytes
         token_to_id[merged_bytes] = current_id
-        merges.append((bytes_a, bytes_b))
+        merges.append((vocab[best_pair[0]],vocab[best_pair[1]]))
 
+        print(merges)
         positions = list(pair_to_position[best_pair])
-        for seq_idx, i in positions:
+        previous_idx=defaultdict(int)
+
+
+        for seq_idx, i in sorted(positions,key=lambda x:x[1]):
+
+
             token_seq, freq = corpus[seq_idx]
+            if i<len(token_seq)-2 and ((token_seq[i],token_seq[i+1]) != (best_pair[0],best_pair[1])):
+                continue
+            if previous_idx.get(seq_idx):
+                i -=previous_idx.get(seq_idx)
             token_seq = list(token_seq)
             # 1. Remove frequencies for broken pairs (left, right)
             left = token_seq[i - 1] if i - 1 >= 0 else None
             right = token_seq[i + 2] if i + 2 < len(token_seq) else None
 
             if left is not None:
-                print(len(token_seq),i)
+                # print(len(token_seq),i,token_seq, best_pair, seq_idx)
                 new_freq = pair_freq[(left, token_seq[i])] -freq
+
                 pair_freq[(left, token_seq[i])] =new_freq
-                heapq.heappush(heap, (-new_freq, vocab[left],vocab[token_seq[i]], (left, token_seq[i])))
                 pair_to_position[(left, token_seq[i])].discard((seq_idx, i - 1))
             if right is not None:
                 new_freq = pair_freq[(token_seq[i+1], right)] - freq
                 pair_freq[(token_seq[i+1], right)] = new_freq
-                heapq.heappush(heap, (-new_freq,  vocab[token_seq[i+1]],vocab[right], ( token_seq[i+1],right)))
                 pair_to_position[(token_seq[i +1], right)].discard((seq_idx, i+1 ))
 
             # 2. Remove freq from the merged pair
             pair_freq[best_pair] -= freq
             pair_to_position[best_pair].discard((seq_idx, i))
 
-            # 3. Merge the pair in the token sequence
-            token_seq[i:i + 2] = [current_id]
+
 
             # 4. Add new frequencies for new pairs (left-new, new-right)
             if left is not None:
                 new_left = (left, current_id)
                 new_freq = pair_freq[new_left] + freq
                 pair_freq[new_left] = new_freq
-                heapq.heappush(heap, (-new_freq, vocab[left], vocab[current_id], (left, current_id)))
                 pair_to_position[new_left].add((seq_idx, i - 1))
+
             if right is not None:
                 new_right = (current_id, right)
                 new_freq = pair_freq[new_right] + freq
                 pair_freq[new_right] = new_freq
-                heapq.heappush(heap,(-new_freq, vocab[current_id], vocab[right],(left,current_id)))
                 pair_to_position[new_right].add((seq_idx, i))
 
+                for j in range(i+2, len(token_seq)-1):
+                    if j<len(token_seq)-1:
+                        pair_to_position[(token_seq[j],token_seq[j+1])].discard((seq_idx, j))
+                        pair_to_position[(token_seq[j], token_seq[j + 1])].add((seq_idx, j-1))
+
+            # 3. Merge the pair in the token sequence
+            token_seq[i:i + 2] = [current_id]
             corpus[seq_idx] = (tuple(token_seq), freq)
+            previous_idx[seq_idx]+=1
 
         current_id += 1
 
